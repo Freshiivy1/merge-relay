@@ -114,11 +114,37 @@ class MergeToneDetector {
 /* Server                                                              */
 /* ------------------------------------------------------------------ */
 
+// Diagnostic counters — readable via GET /stats to make the relay a glass box.
+const stats = {
+  startedAt: new Date().toISOString(),
+  node: process.version,
+  connections: 0,
+  closedNoSid: 0,
+  frames: 0,
+  lastSid: "",
+  lastFireAt: "",
+  lastFireMs: 0,
+  lastCallbackStatus: 0,
+  lastError: "",
+  uncaught: 0,
+};
+
+process.on("uncaughtException", (err) => {
+  stats.uncaught++;
+  stats.lastError = "uncaught: " + err.message;
+  console.error("[relay] uncaughtException:", err);
+});
+
 const server = http.createServer((req, res) => {
   // Health check (Render/Railway/Fly hit this)
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "callverify-merge-relay" }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/stats") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(stats));
     return;
   }
   res.writeHead(404);
@@ -130,9 +156,12 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws, req) => {
   const sid = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
   if (!sid) {
+    stats.closedNoSid++;
     ws.close();
     return;
   }
+  stats.connections++;
+  stats.lastSid = sid;
   const detector = new MergeToneDetector();
   const t0 = Date.now();
   let frames = 0;
@@ -148,13 +177,18 @@ wss.on("connection", (ws, req) => {
     if (msg.event !== "media" || !msg.media?.payload) return;
     if (msg.media.track && msg.media.track !== "inbound") return;
     frames++;
+    stats.frames++;
     if (detector.push(msg.media.payload)) {
       const ms = Date.now() - t0;
+      stats.lastFireAt = new Date().toISOString();
+      stats.lastFireMs = ms;
       console.log(`[relay] MERGE TONE DETECTED sid=${sid} (${ms}ms after connect, frame ${frames})`);
       fetch(`${CALLBACK_URL}?sid=${encodeURIComponent(sid)}`, {
         method: "POST",
         headers: { "x-verify-secret": SECRET },
-      }).catch((err) => console.error("[relay] callback failed:", err.message));
+      })
+        .then((r) => { stats.lastCallbackStatus = r.status; })
+        .catch((err) => { stats.lastError = err.message; console.error("[relay] callback failed:", err.message); });
     }
   });
 
