@@ -22,7 +22,21 @@
  * a VPS, etc.). See README.md for step-by-step deployment.
  */
 import http from "http";
+import fs from "fs";
 import { WebSocketServer } from "ws";
+
+// Minimal .env loader (no dependency): lets platforms that can't set env
+// vars via a dashboard (or where that step was skipped) run from a
+// committed .env. Real environment variables always take precedence.
+try {
+  for (const line of fs.readFileSync(new URL("./.env", import.meta.url), "utf8").split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) {
+      const k = line.slice(0, i).trim();
+      if (k && !(k in process.env)) process.env[k] = line.slice(i + 1).trim();
+    }
+  }
+} catch { /* no .env — rely on real env vars */ }
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const CALLBACK_URL = (process.env.CALLBACK_URL || "").replace(/\/+$/, "");
