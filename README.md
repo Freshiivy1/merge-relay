@@ -43,8 +43,8 @@ PORT=8080 node server.js
 
 | Var | Value |
 |---|---|
-| `CALLBACK_URL` | `https://<your-app-domain>/api/verify/stream-detected` |
-| `STREAM_SECRET` | Any long random string — must match the app's `VERIFY_STREAM_SECRET` |
+| `CALLBACK_URL` | `https://226orhimcsy72.kimi.pro/api/verify/stream-detected` |
+| `STREAM_SECRET` | `k7X9mQ2vR8pL4wN6jH3fB5tY1zA0cV8b` |
 | `PORT` | Listen port (default 8080; most platforms inject their own `PORT`) |
 
 ## Then configure the main app
@@ -53,8 +53,8 @@ Set these env vars on the main app and republish:
 
 | Var | Value |
 |---|---|
-| `VERIFY_STREAM_URL` | `wss://<relay-host>/` (the relay's public WebSocket URL) |
-| `VERIFY_STREAM_SECRET` | Same secret as the relay's `STREAM_SECRET` |
+| `VERIFY_STREAM_URL` | `wss://merge-relay.onrender.com` (the relay's public WebSocket URL) |
+| `VERIFY_STREAM_SECRET` | `k7X9mQ2vR8pL4wN6jH3fB5tY1zA0cV8b` (same as the relay's `STREAM_SECRET`) |
 
 ## Verify it works
 
