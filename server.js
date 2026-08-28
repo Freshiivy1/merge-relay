@@ -142,6 +142,30 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, service: "callverify-merge-relay" }));
     return;
   }
+  // Self-hosted TwiML for the CallVerify demo flow — keeps Twilio fetches off
+  // flaky third-party hosts; presses are observable via /stats.
+  if (req.method === "GET" && (req.url || "").startsWith("/twiml/")) {
+    const kind = req.url.split("/")[2].split("?")[0];
+    const base = "https://" + (req.headers.host || "");
+    const sidParam = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
+    let body = null;
+    if (kind === "step2") {
+      stats.acceptPressAt = Date.now();
+      body = `<Response><Gather numDigits="1" action="${base}/twiml/hold" method="GET" timeout="15"><Say voice="Polly.Brian">Thank you. Press 1 when you are ready to proceed.</Say></Gather><Redirect method="GET">${base}/twiml/hold</Redirect></Response>`;
+    } else if (kind === "hold") {
+      stats.readyPressAt = Date.now();
+      body = `<Response><Pause length="60"/><Redirect method="GET">${base}/twiml/hold</Redirect></Response>`;
+    } else if (kind === "legb") {
+      body = `<Response><Start><Stream url="wss://${req.headers.host}/?sid=${sidParam}"><Parameter name="sid" value="${sidParam}"/></Stream></Start><Pause length="600"/></Response>`;
+    } else if (kind === "verdict") {
+      body = `<Response><Say voice="Polly.Brian">Merge detected. Verification complete. This line is confirmed as a cellular phone.</Say><Hangup/></Response>`;
+    }
+    if (body === null) { res.writeHead(404); res.end(); return; }
+    stats.lastTwiml = kind;
+    res.writeHead(200, { "Content-Type": "text/xml" });
+    res.end(body);
+    return;
+  }
   if (req.method === "GET" && req.url === "/stats") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(stats));
