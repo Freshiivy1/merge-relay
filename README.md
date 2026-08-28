@@ -53,7 +53,7 @@ Set these env vars on the main app and republish:
 
 | Var | Value |
 |---|---|
-| `VERIFY_STREAM_URL` | `wss://merge-relay.onrender.com` (the relay's public WebSocket URL) |
+| `VERIFY_STREAM_URL` | `wss://merge-relay-a7ws.onrender.com` (the relay's public WebSocket URL) |
 | `VERIFY_STREAM_SECRET` | `k7X9mQ2vR8pL4wN6jH3fB5tY1zA0cV8b` (same as the relay's `STREAM_SECRET`) |
 
 ## Verify it works
