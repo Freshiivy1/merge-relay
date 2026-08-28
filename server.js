@@ -78,6 +78,20 @@ const TONE_RATIO = 0.05;  // p/(E·N²): dual-tone ≈ 0.25, noise ≈ 0.0025
 const ENERGY_FLOOR = 1e6;
 const NEED_WINDOWS = 6;   // 300 ms continuous tone → fire
 
+/* Instant in-band verdict: pre-encoded mu-law 8kHz frames (20ms each).
+   On duplex legs (<Connect><Stream>) the verdict is written straight into the
+   open socket the moment the detector fires — no Twilio REST round-trip,
+   so merge -> verdict lands in ~0.3-0.4s. */
+const VERDICT_FRAMES = [];
+try {
+  const raw = fs.readFileSync(new URL("./verdict.ulaw", import.meta.url));
+  for (let i = 0; i + 160 <= raw.length; i += 160)
+    VERDICT_FRAMES.push(raw.subarray(i, i + 160).toString("base64"));
+  console.log(`[relay] verdict audio loaded: ${VERDICT_FRAMES.length} frames`);
+} catch { console.warn("[relay] verdict.ulaw missing — instant verdict disabled"); }
+
+const armed = new Map(); // sid -> { legA } — registered by the orchestrator
+
 class MergeToneDetector {
   constructor() {
     this.buf = [];
@@ -142,6 +156,21 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, service: "callverify-merge-relay" }));
     return;
   }
+  // Orchestrator registers sid -> Leg A callSid so a detection can tear it down.
+  if (req.method === "POST" && req.url === "/arm") {
+    if (req.headers["x-verify-secret"] !== SECRET) { res.writeHead(403); res.end(); return; }
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const j = JSON.parse(body);
+        if (j.sid) armed.set(j.sid, { legA: j.legA || "" });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end('{"ok":true}');
+      } catch { res.writeHead(400); res.end(); }
+    });
+    return;
+  }
   // Self-hosted TwiML for the CallVerify demo flow — keeps Twilio fetches off
   // flaky third-party hosts; presses are observable via /stats.
   if (req.method === "GET" && (req.url || "").startsWith("/twiml/")) {
@@ -157,6 +186,8 @@ const server = http.createServer((req, res) => {
       body = `<Response><Pause length="60"/><Redirect method="GET">${base}/twiml/hold</Redirect></Response>`;
     } else if (kind === "legb") {
       body = `<Response><Start><Stream url="wss://${req.headers.host}/?sid=${sidParam}"><Parameter name="sid" value="${sidParam}"/></Stream></Start><Pause length="600"/></Response>`;
+    } else if (kind === "legb2") {
+      body = `<Response><Connect><Stream url="wss://${req.headers.host}/?sid=${sidParam}"><Parameter name="sid" value="${sidParam}"/><Parameter name="mode" value="duplex"/></Stream></Connect></Response>`;
     } else if (kind === "verdict") {
       body = `<Response><Say voice="Polly.Brian">Merge detected. Verification complete. This line is confirmed as a cellular phone.</Say><Hangup/></Response>`;
     }
@@ -185,6 +216,8 @@ wss.on("connection", (ws, req) => {
   let sid = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
   let detector = null;
   let frames = 0;
+  let streamSid = "";
+  let duplex = false;
   const t0 = Date.now();
   // Close only if still unidentified 10s in (no query sid and no start params).
   const identTimer = setTimeout(() => {
@@ -215,6 +248,8 @@ wss.on("connection", (ws, req) => {
       return;
     }
     if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || streamSid;
+      if (msg.start?.customParameters?.mode === "duplex") duplex = true;
       adoptSid(msg.start?.customParameters?.sid);
       return;
     }
@@ -228,6 +263,34 @@ wss.on("connection", (ws, req) => {
       stats.lastFireAt = new Date().toISOString();
       stats.lastFireMs = ms;
       console.log(`[relay] MERGE TONE DETECTED sid=${sid} (${ms}ms after connect, frame ${frames})`);
+      // INSTANT VERDICT (duplex legs): write pre-encoded verdict audio into
+      // the open socket — merge -> verdict in ~0.3-0.4s, no Twilio round-trip.
+      if (duplex && streamSid && VERDICT_FRAMES.length) {
+        const tFire = Date.now();
+        let i = 0;
+        const iv = setInterval(() => {
+          if (ws.readyState !== 1 || i >= VERDICT_FRAMES.length) {
+            clearInterval(iv);
+            try { ws.close(); } catch { }
+            return;
+          }
+          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: VERDICT_FRAMES[i++] } }));
+        }, 20);
+        stats.verdicts = (stats.verdicts || 0) + 1;
+        stats.lastVerdictLagMs = Date.now() - tFire;
+      }
+      // tear down Leg A (fire-and-forget; does not delay the verdict)
+      const arm = armed.get(sid);
+      if (arm?.legA && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+        fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${arm.legA}.json`, {
+          method: "POST",
+          headers: {
+            Authorization: "Basic " + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64"),
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "Status=completed",
+        }).catch((e) => console.error("[relay] legA teardown failed:", e.message));
+      }
       fetch(`${CALLBACK_URL}?sid=${encodeURIComponent(sid)}`, {
         method: "POST",
         headers: { "x-verify-secret": SECRET },
