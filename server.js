@@ -154,18 +154,34 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
-  const sid = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
-  if (!sid) {
-    stats.closedNoSid++;
-    ws.close();
-    return;
-  }
-  stats.connections++;
-  stats.lastSid = sid;
-  const detector = new MergeToneDetector();
-  const t0 = Date.now();
+  stats.lastUrl = req.url || "";
+  // Identify the session either via ?sid= in the URL OR via a
+  // <Parameter name="sid"> in Twilio's "start" message (customParameters) —
+  // the canonical Twilio way, immune to any query-string stripping.
+  let sid = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
+  let detector = null;
   let frames = 0;
-  console.log(`[relay] stream connected sid=${sid}`);
+  const t0 = Date.now();
+  // Close only if still unidentified 10s in (no query sid and no start params).
+  const identTimer = setTimeout(() => {
+    if (!sid) {
+      stats.closedNoSid++;
+      try { ws.close(); } catch { }
+    }
+  }, 10000);
+  console.log(`[relay] stream connected sid=${sid || "(pending)"} url=${req.url}`);
+
+  const adoptSid = (value) => {
+    if (!sid && typeof value === "string" && value) sid = value;
+    if (sid && !detector) {
+      detector = new MergeToneDetector();
+      stats.connections++;
+      stats.lastSid = sid;
+      clearTimeout(identTimer);
+      console.log(`[relay] stream identified sid=${sid}`);
+    }
+  };
+  if (sid) adoptSid(sid);
 
   ws.on("message", (data) => {
     let msg;
@@ -174,8 +190,13 @@ wss.on("connection", (ws, req) => {
     } catch {
       return;
     }
+    if (msg.event === "start") {
+      adoptSid(msg.start?.customParameters?.sid);
+      return;
+    }
     if (msg.event !== "media" || !msg.media?.payload) return;
     if (msg.media.track && msg.media.track !== "inbound") return;
+    if (!detector) return; // unidentified yet — drop audio
     frames++;
     stats.frames++;
     if (detector.push(msg.media.payload)) {
@@ -192,7 +213,7 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => console.log(`[relay] stream closed sid=${sid} frames=${frames}`));
+  ws.on("close", () => { clearTimeout(identTimer); console.log(`[relay] stream closed sid=${sid} frames=${frames}`); });
   ws.on("error", (err) => console.error(`[relay] ws error sid=${sid}:`, err.message));
 });
 
