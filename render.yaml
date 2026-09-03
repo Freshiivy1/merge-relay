@@ -12,6 +12,10 @@ services:
     envVars:
       - key: CALLBACK_URL
         sync: false
+      - key: STREAM_READY_URL
+        sync: false
+      - key: STREAM_FAILED_URL
+        sync: false
       - key: APP_EVENTS_URL
         sync: false
       - key: STREAM_SECRET
