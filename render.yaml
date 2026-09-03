@@ -1,0 +1,18 @@
+# Render blueprint for the CallVerify merge-detection relay.
+# Set STREAM_SECRET and CALLBACK_URL in the dashboard (or via env var sync);
+# they are marked sync: false so no secret is ever committed.
+services:
+  - type: web
+    name: merge-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: CALLBACK_URL
+        sync: false
+      - key: APP_EVENTS_URL
+        sync: false
+      - key: STREAM_SECRET
+        sync: false

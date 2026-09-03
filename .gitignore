@@ -1,0 +1,5 @@
+node_modules/
+.env
+relay-state.json
+relay-state.json.tmp
+*.log

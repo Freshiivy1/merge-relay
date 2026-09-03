@@ -1,12 +1,13 @@
 {
   "name": "callverify-merge-relay",
-  "version": "1.0.0",
-  "description": "Real-time merge-tone detector relay for the CallVerify Twilio port. Hosts the WebSocket endpoint that Twilio Media Streams connects to, runs a Goertzel DTMF-9 (852+1336 Hz) detector on the live audio, and calls back to the main app the instant a merge is detected (~0.3s).",
+  "version": "2.0.0",
+  "description": "Two-phase merge-detection relay for the CallVerify Twilio port. Hosts the inbound-only WebSocket endpoint that Twilio Media Streams connects to. Phase 1 matches the spoken-prompt fingerprint plus a light 852+1336 Hz (DTMF-8) watermark; Phase 2 runs the existing loud DTMF-8 Goertzel detector alone. Each phase independently finalizes MERGE_DETECTED and posts a structured verdict callback to the main app.",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node selftest.mjs"
+    "check": "node --check server.js && node --check lib/relay.js && node --check lib/detectors.js && node --check lib/dsp.js && node --check lib/state.js",
+    "test": "npm run check && node --test test/ && node selftest.mjs"
   },
   "engines": {
     "node": ">=18"

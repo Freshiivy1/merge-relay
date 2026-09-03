@@ -1,33 +1,48 @@
 /**
- * CallVerify merge-detection relay.
+ * CallVerify merge-detection relay — two-phase call architecture.
  *
  * Why this exists: the main app's hosting platform blocks WebSocket upgrades,
  * and Twilio's <Gather> cannot hear in-band audio tones — so real-time
  * (<0.5s) merge detection requires a WebSocket-capable host. This tiny
  * standalone service is that host:
  *
- *   1. Leg B's TwiML opens a Twilio Media Stream to  wss://<this-host>/?sid=…
- *   2. We run a Goertzel detector for the continuous DTMF-'9' merge tone
- *      (852 Hz + 1336 Hz) over the inbound μ-law audio frames
- *   3. The instant the tone leaks across a merged call, we POST
- *      CALLBACK_URL?sid=… with the shared secret header — the main app then
- *      plays the verdict and terminates both calls
+ *   1. Leg B's TwiML opens a background inbound-only Twilio Media Stream
+ *      (<Start><Stream track="inbound_track">) to wss://<this-host>/ and
+ *      identifies itself via start.customParameters {sid, leg, mode,
+ *      challengeToken} — never via the URL query string.
+ *   2. Phase 1 PROMPT_LIGHT_MODE: the prompt fingerprint (normalized cross
+ *      correlation) AND the overlapping light 852+1336 Hz DTMF-8 watermark
+ *      together finalize MERGE_DETECTED immediately.
+ *   3. At the persisted promptEndsAt the session clears partial Phase 1
+ *      evidence and switches to LOUD_DTMF_MODE, where the existing loud
+ *      DTMF-8 detector ALONE finalizes MERGE_DETECTED immediately.
+ *   4. Verdicts are POSTed to CALLBACK_URL as structured JSON with the
+ *      shared-secret header; stream lifecycle events go to APP_EVENTS_URL.
+ *      The relay never writes media into the Leg B stream.
  *
- * Config (environment variables):
- *   PORT            listen port (default 8080)
- *   CALLBACK_URL    e.g. https://your-app/api/verify/stream-detected
- *   STREAM_SECRET   shared secret — must match the app's VERIFY_STREAM_SECRET
+ * Config (environment variables; a local untracked .env is honored in dev):
+ *   PORT               listen port (default 8080)
+ *   CALLBACK_URL       e.g. https://your-app/api/verify/stream-detected
+ *   APP_EVENTS_URL     optional; derived from CALLBACK_URL when unset
+ *   STREAM_SECRET      shared secret — must match the app's VERIFY_STREAM_SECRET
+ *   STATE_FILE         atomic JSON session state (default ./relay-state.json)
+ *   LIGHT_TONE_RATIO   Phase 1 light-watermark Goertzel floor (default 1e-3)
+ *   LIGHT_NEED_WINDOWS consecutive 50 ms windows for the watermark (default 6)
+ *   PROMPT_NCC_THRESHOLD  fingerprint match threshold (default from asset: 0.5)
+ *   SILENCE_TIMEOUT_MS   no-media timeout (default 15000)
+ *   SESSION_TIMEOUT_MS   absolute per-session timeout (default 600000)
+ *   HEARTBEAT_MS         websocket ping interval (default 30000)
+ *   MAX_BODY_BYTES       HTTP JSON body cap (default 65536)
  *
  * Any Node 18+ host with WebSocket support works (Render, Railway, Fly.io,
  * a VPS, etc.). See README.md for step-by-step deployment.
  */
-import http from "http";
 import fs from "fs";
-import { WebSocketServer } from "ws";
+import { createRelay } from "./lib/relay.js";
 
-// Minimal .env loader (no dependency): lets platforms that can't set env
-// vars via a dashboard (or where that step was skipped) run from a
-// committed .env. Real environment variables always take precedence.
+// Minimal .env loader (no dependency): reads a LOCAL, UNTRACKED .env for
+// development. Real environment variables always take precedence. Never
+// commit a .env — see .env.example.
 try {
   for (const line of fs.readFileSync(new URL("./.env", import.meta.url), "utf8").split("\n")) {
     const i = line.indexOf("=");
@@ -36,274 +51,45 @@ try {
       if (k && !(k in process.env)) process.env[k] = line.slice(i + 1).trim();
     }
   }
-} catch { /* no .env — rely on real env vars */ }
+} catch { /* no local .env — rely on real env vars */ }
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
-const CALLBACK_URL = (process.env.CALLBACK_URL || "").replace(/\/+$/, "");
-const SECRET = process.env.STREAM_SECRET || "";
 
-if (!CALLBACK_URL || !SECRET) {
-  console.error("FATAL: set CALLBACK_URL and STREAM_SECRET env vars");
-  process.exit(1);
-}
-
-/* ------------------------------------------------------------------ */
-/* DSP — μ-law decode + Goertzel (identical to the main app's, tested) */
-/* ------------------------------------------------------------------ */
-
-const SAMPLE_RATE = 8000;
-
-function decodeMulaw(u) {
-  u = ~u & 0xff;
-  let t = ((u & 0x0f) << 3) + 0x84;
-  t <<= (u & 0x70) >> 4;
-  return u & 0x80 ? 0x84 - t : t - 0x84;
-}
-
-function goertzelPower(samples, freq) {
-  const w = (2 * Math.PI * freq) / SAMPLE_RATE;
-  const cw = 2 * Math.cos(w);
-  let s1 = 0;
-  let s2 = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const s0 = samples[i] + cw * s1 - s2;
-    s2 = s1;
-    s1 = s0;
-  }
-  return s1 * s1 + s2 * s2 - cw * s1 * s2;
-}
-
-const WIN = 400;          // 50 ms windows
-const TONE_RATIO = 0.05;  // p/(E·N²): dual-tone ≈ 0.25, noise ≈ 0.0025
-const ENERGY_FLOOR = 1e6;
-const NEED_WINDOWS = 6;   // 300 ms continuous tone → fire
-
-/* Instant in-band verdict: pre-encoded mu-law 8kHz frames (20ms each).
-   On duplex legs (<Connect><Stream>) the verdict is written straight into the
-   open socket the moment the detector fires — no Twilio REST round-trip,
-   so merge -> verdict lands in ~0.3-0.4s. */
-const VERDICT_FRAMES = [];
+let fingerprint = null;
 try {
-  const raw = fs.readFileSync(new URL("./verdict.ulaw", import.meta.url));
-  for (let i = 0; i + 160 <= raw.length; i += 160)
-    VERDICT_FRAMES.push(raw.subarray(i, i + 160).toString("base64"));
-  console.log(`[relay] verdict audio loaded: ${VERDICT_FRAMES.length} frames`);
-} catch { console.warn("[relay] verdict.ulaw missing — instant verdict disabled"); }
-
-const armed = new Map(); // sid -> { legA } — registered by the orchestrator
-
-class MergeToneDetector {
-  constructor() {
-    this.buf = [];
-    this.streak = 0;
-    this.fired = false;
-  }
-  /** Feed one base64 μ-law frame (20 ms); returns true exactly once on fire. */
-  push(payloadB64) {
-    if (this.fired) return false;
-    const bytes = Buffer.from(payloadB64, "base64");
-    for (const b of bytes) this.buf.push(decodeMulaw(b));
-    while (this.buf.length >= WIN) {
-      const window = this.buf.slice(0, WIN);
-      this.buf = this.buf.slice(WIN);
-      let e = 0;
-      for (let i = 0; i < window.length; i++) e += window[i] * window[i];
-      e /= window.length;
-      const norm = e * WIN * WIN;
-      const hit =
-        e > ENERGY_FLOOR &&
-        goertzelPower(window, 852) / norm > TONE_RATIO &&
-        goertzelPower(window, 1336) / norm > TONE_RATIO;
-      this.streak = hit ? this.streak + 1 : 0;
-      if (this.streak >= NEED_WINDOWS) {
-        this.fired = true;
-        return true;
-      }
-    }
-    return false;
-  }
+  fingerprint = JSON.parse(fs.readFileSync(new URL("./prompt-fingerprint.json", import.meta.url), "utf8"));
+  console.log(`[relay] prompt fingerprint loaded: ${fingerprint.asset} (${fingerprint.durationMs} ms)`);
+} catch (err) {
+  console.error("[relay] prompt-fingerprint.json missing/invalid — Phase 1 fingerprinting disabled:", err.message);
 }
 
-/* ------------------------------------------------------------------ */
-/* Server                                                              */
-/* ------------------------------------------------------------------ */
-
-// Diagnostic counters — readable via GET /stats to make the relay a glass box.
-const stats = {
-  startedAt: new Date().toISOString(),
-  node: process.version,
-  connections: 0,
-  closedNoSid: 0,
-  frames: 0,
-  lastSid: "",
-  lastFireAt: "",
-  lastFireMs: 0,
-  lastCallbackStatus: 0,
-  lastError: "",
-  uncaught: 0,
-};
+const relay = createRelay({
+  callbackUrl: process.env.CALLBACK_URL || "",
+  appEventsUrl: process.env.APP_EVENTS_URL || "",
+  secret: process.env.STREAM_SECRET || "",
+  stateFile: process.env.STATE_FILE || new URL("./relay-state.json", import.meta.url).pathname,
+  fingerprint,
+  lightRatioFloor: process.env.LIGHT_TONE_RATIO ? Number(process.env.LIGHT_TONE_RATIO) : undefined,
+  lightNeedWindows: process.env.LIGHT_NEED_WINDOWS ? Number(process.env.LIGHT_NEED_WINDOWS) : undefined,
+  promptThreshold: process.env.PROMPT_NCC_THRESHOLD ? Number(process.env.PROMPT_NCC_THRESHOLD) : undefined,
+  silenceTimeoutMs: process.env.SILENCE_TIMEOUT_MS ? Number(process.env.SILENCE_TIMEOUT_MS) : undefined,
+  sessionTimeoutMs: process.env.SESSION_TIMEOUT_MS ? Number(process.env.SESSION_TIMEOUT_MS) : undefined,
+  heartbeatMs: process.env.HEARTBEAT_MS ? Number(process.env.HEARTBEAT_MS) : undefined,
+  maxBodyBytes: process.env.MAX_BODY_BYTES ? Number(process.env.MAX_BODY_BYTES) : undefined,
+});
 
 process.on("uncaughtException", (err) => {
-  stats.uncaught++;
-  stats.lastError = "uncaught: " + err.message;
+  relay.stats.uncaught++;
+  relay.stats.lastError = "uncaught: " + err.message;
   console.error("[relay] uncaughtException:", err);
 });
 
-const server = http.createServer((req, res) => {
-  // Health check (Render/Railway/Fly hit this)
-  if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "callverify-merge-relay" }));
-    return;
-  }
-  // Orchestrator registers sid -> Leg A callSid so a detection can tear it down.
-  if (req.method === "POST" && req.url === "/arm") {
-    if (req.headers["x-verify-secret"] !== SECRET) { res.writeHead(403); res.end(); return; }
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      try {
-        const j = JSON.parse(body);
-        if (j.sid) armed.set(j.sid, { legA: j.legA || "" });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end('{"ok":true}');
-      } catch { res.writeHead(400); res.end(); }
-    });
-    return;
-  }
-  // Self-hosted TwiML for the CallVerify demo flow — keeps Twilio fetches off
-  // flaky third-party hosts; presses are observable via /stats.
-  if (req.method === "GET" && (req.url || "").startsWith("/twiml/")) {
-    const kind = req.url.split("/")[2].split("?")[0];
-    const base = "https://" + (req.headers.host || "");
-    const sidParam = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
-    let body = null;
-    if (kind === "step2") {
-      stats.acceptPressAt = Date.now();
-      body = `<Response><Gather numDigits="1" action="${base}/twiml/hold" method="GET" timeout="15"><Say voice="Polly.Brian">Thank you. Press 1 when you are ready to proceed.</Say></Gather><Redirect method="GET">${base}/twiml/hold</Redirect></Response>`;
-    } else if (kind === "hold") {
-      stats.readyPressAt = Date.now();
-      body = `<Response><Pause length="60"/><Redirect method="GET">${base}/twiml/hold</Redirect></Response>`;
-    } else if (kind === "legb") {
-      body = `<Response><Start><Stream url="wss://${req.headers.host}/?sid=${sidParam}"><Parameter name="sid" value="${sidParam}"/></Stream></Start><Pause length="600"/></Response>`;
-    } else if (kind === "legb2") {
-      body = `<Response><Connect><Stream url="wss://${req.headers.host}/?sid=${sidParam}"><Parameter name="sid" value="${sidParam}"/><Parameter name="mode" value="duplex"/></Stream></Connect></Response>`;
-    } else if (kind === "verdict") {
-      body = `<Response><Say voice="Polly.Brian">Merge detected. Verification complete. This line is confirmed as a cellular phone.</Say><Hangup/></Response>`;
-    }
-    if (body === null) { res.writeHead(404); res.end(); return; }
-    stats.lastTwiml = kind;
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(body);
-    return;
-  }
-  if (req.method === "GET" && req.url === "/stats") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(stats));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
-});
+if (!process.env.CALLBACK_URL || !process.env.STREAM_SECRET) {
+  // The process still serves /health and /ready (which reports 503) so the
+  // hosting platform surfaces the misconfiguration instead of crash-looping.
+  console.error("[relay] WARNING: CALLBACK_URL and STREAM_SECRET env vars are required — relay is NOT ready");
+}
 
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws, req) => {
-  stats.lastUrl = req.url || "";
-  // Identify the session either via ?sid= in the URL OR via a
-  // <Parameter name="sid"> in Twilio's "start" message (customParameters) —
-  // the canonical Twilio way, immune to any query-string stripping.
-  let sid = new URL(req.url, "http://localhost").searchParams.get("sid") || "";
-  let detector = null;
-  let frames = 0;
-  let streamSid = "";
-  let duplex = false;
-  const t0 = Date.now();
-  // Close only if still unidentified 10s in (no query sid and no start params).
-  const identTimer = setTimeout(() => {
-    if (!sid) {
-      stats.closedNoSid++;
-      try { ws.close(); } catch { }
-    }
-  }, 10000);
-  console.log(`[relay] stream connected sid=${sid || "(pending)"} url=${req.url}`);
-
-  const adoptSid = (value) => {
-    if (!sid && typeof value === "string" && value) sid = value;
-    if (sid && !detector) {
-      detector = new MergeToneDetector();
-      stats.connections++;
-      stats.lastSid = sid;
-      clearTimeout(identTimer);
-      console.log(`[relay] stream identified sid=${sid}`);
-    }
-  };
-  if (sid) adoptSid(sid);
-
-  ws.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || streamSid;
-      if (msg.start?.customParameters?.mode === "duplex") duplex = true;
-      adoptSid(msg.start?.customParameters?.sid);
-      return;
-    }
-    if (msg.event !== "media" || !msg.media?.payload) return;
-    if (msg.media.track && msg.media.track !== "inbound") return;
-    if (!detector) return; // unidentified yet — drop audio
-    frames++;
-    stats.frames++;
-    if (detector.push(msg.media.payload)) {
-      const ms = Date.now() - t0;
-      stats.lastFireAt = new Date().toISOString();
-      stats.lastFireMs = ms;
-      console.log(`[relay] MERGE TONE DETECTED sid=${sid} (${ms}ms after connect, frame ${frames})`);
-      // INSTANT VERDICT (duplex legs): write pre-encoded verdict audio into
-      // the open socket — merge -> verdict in ~0.3-0.4s, no Twilio round-trip.
-      if (duplex && streamSid && VERDICT_FRAMES.length) {
-        const tFire = Date.now();
-        let i = 0;
-        const iv = setInterval(() => {
-          if (ws.readyState !== 1 || i >= VERDICT_FRAMES.length) {
-            clearInterval(iv);
-            try { ws.close(); } catch { }
-            return;
-          }
-          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: VERDICT_FRAMES[i++] } }));
-        }, 20);
-        stats.verdicts = (stats.verdicts || 0) + 1;
-        stats.lastVerdictLagMs = Date.now() - tFire;
-      }
-      // tear down Leg A (fire-and-forget; does not delay the verdict)
-      const arm = armed.get(sid);
-      if (arm?.legA && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-        fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${arm.legA}.json`, {
-          method: "POST",
-          headers: {
-            Authorization: "Basic " + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64"),
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: "Status=completed",
-        }).catch((e) => console.error("[relay] legA teardown failed:", e.message));
-      }
-      fetch(`${CALLBACK_URL}?sid=${encodeURIComponent(sid)}`, {
-        method: "POST",
-        headers: { "x-verify-secret": SECRET },
-      })
-        .then((r) => { stats.lastCallbackStatus = r.status; })
-        .catch((err) => { stats.lastError = err.message; console.error("[relay] callback failed:", err.message); });
-    }
-  });
-
-  ws.on("close", () => { clearTimeout(identTimer); console.log(`[relay] stream closed sid=${sid} frames=${frames}`); });
-  ws.on("error", (err) => console.error(`[relay] ws error sid=${sid}:`, err.message));
-});
-
-server.listen(PORT, () => {
-  console.log(`[relay] listening on :${PORT} — wss://<host>/?sid=<sessionId>`);
+relay.server.listen(PORT, () => {
+  console.log(`[relay] listening on :${PORT} — wss://<host>/ (customParameters identification)`);
 });
