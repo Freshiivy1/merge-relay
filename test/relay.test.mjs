@@ -6,7 +6,7 @@ import path from "path";
 import fs from "fs";
 import WebSocket from "ws";
 import {
-  createRelay, deriveCallbackUrl, streamToken,
+  createRelay, deriveCallbackUrl, streamToken, toEpochMs,
   PHASE_LOUD, PHASE_PROMPT_LIGHT,
 } from "../lib/relay.js";
 import { MergeToneDetector, LightToneDetector, PromptFingerprintMatcher } from "../lib/detectors.js";
@@ -276,6 +276,62 @@ test("stream-ready is sent exactly once per sid across reconnects", async () => 
   }
 });
 
+test("stale socket close/error/stop after reconnect must not finalize the live session", async () => {
+  const h = await startHarness();
+  try {
+    const ws1 = await readySession(h, "s-reconnect");
+    // Second Twilio stream for the same sid takes ownership of the session.
+    const ws2 = await connectStream(h, { sid: "s-reconnect" });
+    await sendFrames(ws2, silenceFrames(50));
+    await waitFor(() => h.relay.sessions.get("s-reconnect")?.ws != null, 2000, "second stream attached");
+    // The OLD socket dies: its close must be ignored (no verdict, session lives).
+    ws1.terminate();
+    await new Promise((r) => setTimeout(r, 400));
+    const session = h.relay.sessions.get("s-reconnect");
+    assert.equal(session.final, null, "stale close must not finalize the live session");
+    assert.equal(session.streamReady, true, "live session stays ready");
+    assert.equal(h.failed.filter((x) => x.body?.sid === "s-reconnect").length, 0);
+    // The CURRENT socket closing still finalizes exactly once.
+    ws2.close();
+    const v = await waitFor(() => h.failed.find((x) => x.body?.sid === "s-reconnect"), 4000, "live socket close finalizes");
+    assert.equal(v.body.verdict, "DETECTION_INCONCLUSIVE");
+    assert.equal(v.body.reason, "socket_closed");
+  } finally {
+    await h.close();
+  }
+});
+
+test("stop before start (no session) is a safe no-op, not a TypeError", async () => {
+  const h = await startHarness();
+  try {
+    // A raw socket that never sends `start`, then a stop: no session exists,
+    // so handleStreamEnd must guard against a null session instead of throwing.
+    const raw = new WebSocket(`ws://127.0.0.1:${h.port}/`);
+    h.clients.add(raw);
+    await new Promise((res, rej) => { raw.on("open", res); raw.on("error", rej); });
+    raw.send(JSON.stringify({ event: "stop", streamSid: "MZnever-started" }));
+    await new Promise((r) => setTimeout(r, 200));
+    // No session, no verdict, no crash.
+    assert.equal(h.relay.sessions.size, 0);
+    assert.equal(h.failed.length + h.detected.length, 0);
+    raw.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test("service stop() before start() is a safe no-op (and idempotent)", async () => {
+  const relay = createRelay({ callbackUrl: "", secret: "", fingerprint: null, log: () => {} });
+  assert.doesNotThrow(() => relay.stop(), "stop() before listen must not throw");
+  assert.doesNotThrow(() => relay.stop(), "stop() is idempotent");
+  assert.doesNotThrow(() => relay.close(), "close() alias is idempotent too");
+  // A started service still stops cleanly.
+  const relay2 = createRelay({ callbackUrl: "", secret: "", fingerprint: null, log: () => {} });
+  await new Promise((r) => relay2.server.listen(0, "127.0.0.1", r));
+  assert.doesNotThrow(() => relay2.stop());
+  assert.doesNotThrow(() => relay2.stop());
+});
+
 test("query-string sid is NOT relied upon: start without customParameters is rejected", async () => {
   const h = await startHarness();
   try {
@@ -411,6 +467,109 @@ test("challenge-start body limit returns 413", async () => {
       body: JSON.stringify({ sid: "x".repeat(1000) }),
     });
     assert.equal(res.status, 413);
+  } finally {
+    await h.close();
+  }
+});
+
+/* --------------------- timestamp wire-type robustness ------------------ */
+
+test("toEpochMs accepts epoch-ms numbers and ISO-8601 strings; rejects junk", () => {
+  assert.equal(toEpochMs(1700000000000), 1700000000000);
+  assert.equal(toEpochMs("1700000000000"), 1700000000000);
+  assert.equal(toEpochMs("2023-11-14T22:13:20.000Z"), 1700000000000);
+  assert.equal(toEpochMs(new Date(1700000000000)), 1700000000000);
+  assert.equal(toEpochMs(0), 0);
+  assert.equal(toEpochMs("not-a-date"), null);
+  assert.equal(toEpochMs(""), null);
+  assert.equal(toEpochMs(NaN), null);
+  assert.equal(toEpochMs(Infinity), null);
+  assert.equal(toEpochMs(null), null);
+  assert.equal(toEpochMs(undefined), null);
+  assert.equal(toEpochMs({}), null);
+});
+
+test("ISO-8601 /challenge-start: session transitions to LOUD_DTMF_MODE after promptEndsAt + tolerance", async () => {
+  const h = await startHarness();
+  try {
+    const ws = await connectStream(h, { sid: "s-iso" });
+    await sendFrames(ws, silenceFrames(100));
+    await waitFor(() => h.ready.find((e) => e.body?.sid === "s-iso"), 4000, "stream-ready");
+
+    const t0 = Date.now();
+    const promptEndsAtMs = t0 + 400;
+    const res = await challengeStart(h, {
+      sid: "s-iso",
+      challengeStartedAt: new Date(t0).toISOString(), // ISO-8601 wire type
+      promptLightDurationMs: 400,
+      promptEndsAt: new Date(promptEndsAtMs).toISOString(), // ISO-8601 wire type
+      transitionToleranceMs: 100,
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.phase, PHASE_PROMPT_LIGHT);
+    assert.equal(body.promptEndsAt, promptEndsAtMs, "stored internally as epoch-ms number");
+    const session = h.relay.sessions.get("s-iso");
+    assert.equal(typeof session.promptEndsAt, "number");
+    assert.equal(session.challengeStartedAt, t0);
+
+    // Cross the persisted boundary, then loud tone alone must finalize —
+    // only possible if the string timestamp was converted (raw arithmetic on
+    // the ISO string would keep the session in PROMPT_LIGHT_MODE forever).
+    await new Promise((r) => setTimeout(r, Math.max(promptEndsAtMs + 100 - Date.now(), 0) + 100));
+    await sendFrames(ws, loudToneFrames());
+    const v = await waitFor(() => h.detected.find((x) => x.body?.sid === "s-iso"), 8000, "Phase 2 verdict");
+    assert.equal(v.body.verdict, "MERGE_DETECTED");
+    assert.equal(v.body.phase, "LOUD_DTMF");
+    assert.equal(session.phase, PHASE_LOUD);
+    ws.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test("epoch-ms /challenge-start still works (numbers unchanged)", async () => {
+  const h = await startHarness();
+  try {
+    const ws = await connectStream(h, { sid: "s-epoch" });
+    await sendFrames(ws, silenceFrames(100));
+    await waitFor(() => h.ready.find((e) => e.body?.sid === "s-epoch"), 4000, "stream-ready");
+    const promptEndsAt = Date.now() + 30000;
+    const res = await challengeStart(h, {
+      sid: "s-epoch", challengeStartedAt: Date.now(), promptLightDurationMs: 30000, promptEndsAt,
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.phase, PHASE_PROMPT_LIGHT);
+    assert.equal(body.promptEndsAt, promptEndsAt);
+    ws.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test("/arm and /challenge-start reject unparseable timestamps with 400; /arm accepts ISO-8601", async () => {
+  const h = await startHarness();
+  try {
+    // /arm with ISO-8601 promptEndsAt — accepted, stored as epoch-ms.
+    const isoEnd = new Date(Date.now() + 60000).toISOString();
+    let res = await arm(h, { sid: "s-arm-iso", promptEndsAt: isoEnd });
+    assert.equal(res.status, 200);
+    assert.equal(h.relay.sessions.get("s-arm-iso").promptEndsAt, Date.parse(isoEnd));
+
+    // Unparseable values are rejected with 400 on BOTH endpoints.
+    res = await arm(h, { sid: "s-arm-bad", promptEndsAt: "not-a-timestamp" });
+    assert.equal(res.status, 400);
+    assert.equal(h.relay.sessions.get("s-arm-bad").promptEndsAt, null, "rejected value not stored");
+
+    const ws = await connectStream(h, { sid: "s-arm-iso" });
+    await sendFrames(ws, silenceFrames(100));
+    await waitFor(() => h.ready.find((e) => e.body?.sid === "s-arm-iso"), 4000, "stream-ready");
+    res = await challengeStart(h, { sid: "s-arm-iso", promptEndsAt: "tomorrow-ish" });
+    assert.equal(res.status, 400);
+    res = await challengeStart(h, { sid: "s-arm-iso", challengeStartedAt: "???" });
+    assert.equal(res.status, 400);
+    ws.close();
   } finally {
     await h.close();
   }
@@ -565,6 +724,47 @@ test("restart reconstructs expired phase as LOUD_DTMF_MODE; verdicts and stream-
     await new Promise((r) => setTimeout(r, 200));
     assert.equal(h2.detected.filter((x) => x.body?.sid === sid).length, 1);
     ws2.close();
+  } finally {
+    try { ws1.terminate(); } catch {}
+    h.app.close();
+    for (const f of [h.stateFile, h.stateFile + ".tmp"]) { try { fs.unlinkSync(f); } catch {} }
+    await h2.close();
+  }
+});
+
+test("restart resumes undelivered terminal callbacks (persisted verdict, exactly-once)", async () => {
+  const sid = "s-redeliver";
+  // The app's stream-detected endpoint is down for the first relay instance:
+  // the verdict is persisted but the callback is never delivered.
+  const h = await startHarness({ failPaths: new Set(["/api/verify/stream-detected"]) });
+  const stateCopy = h.stateFile + ".copy";
+  let ws1;
+  {
+    ws1 = await readySession(h, sid, { promptEndsAt: Date.now() - 500, transitionToleranceMs: 100 });
+    await sendFrames(ws1, loudToneFrames());
+    await waitFor(() => h.relay.sessions.get(sid)?.final, 4000, "verdict persisted");
+    await waitFor(() => h.relay.stats.callbackExhausted >= 1, 8000, "terminal callback exhausted");
+    const session = h.relay.sessions.get(sid);
+    assert.equal(session.final.result, "MERGE_DETECTED");
+    assert.equal(session.finalDelivered, false, "callback never delivered before crash");
+    fs.copyFileSync(h.stateFile, stateCopy);
+  }
+  // Simulate a crash/restart over the same STATE_FILE, app now healthy.
+  h.relay.close();
+  await new Promise((r) => setTimeout(r, 50));
+  const h2 = await startHarness({ stateFile: stateCopy });
+  h2.clients.add(ws1);
+  try {
+    const v = await waitFor(() => h2.detected.find((x) => x.body?.sid === sid), 8000, "resumed terminal callback");
+    assert.equal(v.body.verdict, "MERGE_DETECTED");
+    assert.equal(v.secret, SECRET);
+    await waitFor(() => h2.relay.sessions.get(sid)?.finalDelivered, 4000, "delivery marker persisted");
+    const persisted = JSON.parse(fs.readFileSync(stateCopy, "utf8")).sessions[sid];
+    assert.equal(persisted.finalDelivered, true);
+    assert.ok(persisted.callbackDeliveredAt > 0, "callbackDeliveredAt persisted on success");
+    // Exactly-once: no duplicate terminal callback for the sid.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h2.detected.filter((x) => x.body?.sid === sid).length, 1);
   } finally {
     try { ws1.terminate(); } catch {}
     h.app.close();
