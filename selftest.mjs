@@ -99,7 +99,7 @@ try {
   check("GET /health", health.status === 200);
   const readyRes = await fetch(`http://127.0.0.1:${PORT}/ready`);
   const readyBody = await readyRes.json();
-  check("GET /ready", readyRes.status === 200 && readyBody.ready === true && readyBody.fingerprint?.durationMs === 18840);
+  check("GET /ready", readyRes.status === 200 && readyBody.ready === true && readyBody.fingerprint?.durationMs === 21360);
   check("GET /stats protected", (await fetch(`http://127.0.0.1:${PORT}/stats`)).status === 403);
   check("demo TwiML disabled by default", (await fetch(`http://127.0.0.1:${PORT}/twiml/legb?sid=x`)).status === 404);
 

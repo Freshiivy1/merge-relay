@@ -182,8 +182,8 @@ test("fingerprint asset format + measured duration contract", () => {
   assert.equal(fp.algorithm, "normalized-log-band-spectral-contour-v1");
   assert.equal(fp.sampleRate, 8000);
   // The measured duration of the rendered prompt+watermark WAV (SPEC §6).
-  assert.equal(fp.durationMs, 18840);
-  assert.equal(fp.frames.length, 752);
+  assert.equal(fp.durationMs, 21360);
+  assert.equal(fp.frames.length, 853);
   assert.equal(fp.bandEdgesHz.length - 1, 16);
   assert.deepEqual(fp.lightTone.frequenciesHz, [852, 1336]);
   assert.ok(fp.frames.every((row) => row.length === 16));
@@ -204,7 +204,7 @@ test("health / ready / stats / body limit / auth", async () => {
     assert.equal(ready.status, 200);
     const readyBody = await ready.json();
     assert.equal(readyBody.ready, true);
-    assert.equal(readyBody.fingerprint.durationMs, 18840);
+    assert.equal(readyBody.fingerprint.durationMs, 21360);
 
     assert.equal((await fetch(`http://127.0.0.1:${h.port}/stats`)).status, 403);
     const stats = await fetch(`http://127.0.0.1:${h.port}/stats`, { headers: { "x-verify-secret": SECRET } });
@@ -393,7 +393,7 @@ test("/arm pre-registers the session and validates the tone pair", async () => {
     assert.equal(res.status, 400);
     res = await arm(h, {
       sid: "s-arm", legA: "CA_A", legB: "CA_B", mode: "merge-detection",
-      tone: { low: 852, high: 1336 }, promptLightDurationMs: 18840, promptEndsAt: Date.now() + 60000,
+      tone: { low: 852, high: 1336 }, promptLightDurationMs: 21360, promptEndsAt: Date.now() + 60000,
     });
     assert.equal(res.status, 200);
     const body = await res.json();
